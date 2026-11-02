@@ -1,0 +1,8 @@
+{
+  "name": "Portal Ujian SMAN 1 Selat - Sistem Distribusi & Pengawasan Ujian Online",
+  "description": "Aplikasi manajemen distribusi link soal Google Form, penjadwalan presisi, penguncian browser anti-kecurangan, dan pemantauan ujian online real-time untuk SMAN 1 Selat.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
