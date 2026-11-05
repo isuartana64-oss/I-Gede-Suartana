@@ -44,10 +44,14 @@ export const StudentPortal: React.FC<StudentPortalProps> = ({
 
   useEffect(() => {
     refreshData();
+    const unsubscribe = schoolStorage.subscribe(refreshData);
     const interval = setInterval(() => {
       setCurrentTime(Date.now());
     }, 1000);
-    return () => clearInterval(interval);
+    return () => {
+      unsubscribe();
+      clearInterval(interval);
+    };
   }, [student]);
 
   // Compute countdown text

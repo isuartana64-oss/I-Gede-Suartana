@@ -71,8 +71,12 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ admin }) => {
 
   useEffect(() => {
     refreshData();
+    const unsubscribe = schoolStorage.subscribe(refreshData);
     const interval = setInterval(refreshData, 3000);
-    return () => clearInterval(interval);
+    return () => {
+      unsubscribe();
+      clearInterval(interval);
+    };
   }, []);
 
   const handleSavePassword = (userId: string) => {

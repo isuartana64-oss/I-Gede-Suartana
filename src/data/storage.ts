@@ -10,6 +10,7 @@ import {
   StudentSession,
   UserSession,
 } from '../types';
+import { supabase, isSupabaseConfigured, safeSupabase } from './supabase';
 
 const STORAGE_KEYS = {
   EXAMS: 'sman1selat_exams_v1',
@@ -25,7 +26,31 @@ export function cleanId(str: string): string {
   return str.replace(/\s+/g, '').trim().toLowerCase();
 }
 
+type StorageChangeListener = () => void;
+
 class SchoolStorage {
+  private listeners: Set<StorageChangeListener> = new Set();
+  private isSyncingWithSupabase = false;
+
+  constructor() {
+    this.initSupabaseSync();
+  }
+
+  public subscribe(listener: StorageChangeListener): () => void {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+
+  private notifyListeners(): void {
+    this.listeners.forEach(cb => {
+      try {
+        cb();
+      } catch (err) {
+        console.warn('Listener notification error:', err);
+      }
+    });
+  }
+
   private getStored<T>(key: string, defaultValue: T): T {
     try {
       const data = localStorage.getItem(key);
@@ -45,6 +70,173 @@ class SchoolStorage {
     }
   }
 
+  // --- SUPABASE CLOUD & REAL-TIME SYNC ---
+  private async initSupabaseSync(): Promise<void> {
+    if (!isSupabaseConfigured || !supabase || this.isSyncingWithSupabase) return;
+    this.isSyncingWithSupabase = true;
+
+    try {
+      // 1. Initial hydration from Supabase
+      const [examsRes, sessionsRes, passwordsRes, notifsRes] = await Promise.all([
+        supabase.from('exams').select('*').order('created_at', { ascending: false }),
+        supabase.from('student_sessions').select('*'),
+        supabase.from('custom_passwords').select('*'),
+        supabase.from('notifications').select('*').order('timestamp', { ascending: false }).limit(50),
+      ]);
+
+      if (examsRes.data) {
+        const formattedExams: ExamSchedule[] = examsRes.data.map(row => ({
+          id: row.id,
+          title: row.title,
+          subject: row.subject,
+          googleFormUrl: row.google_form_url,
+          targetClasses: row.target_classes || [],
+          allowedStudentNisList: row.allowed_student_nis_list || [],
+          startTime: row.start_time,
+          endTime: row.end_time,
+          durationMinutes: row.duration_minutes,
+          lockBrowser: row.lock_browser,
+          instructions: row.instructions,
+          teacherNip: row.teacher_nip,
+          teacherName: row.teacher_name,
+          status: row.status,
+          createdAt: row.created_at,
+        }));
+        this.setStored(STORAGE_KEYS.EXAMS, formattedExams);
+      }
+
+      if (sessionsRes.data) {
+        const formattedSessions: StudentSession[] = sessionsRes.data.map(row => ({
+          id: row.id,
+          examId: row.exam_id,
+          studentNis: row.student_nis,
+          studentName: row.student_name,
+          className: row.class_name,
+          status: row.status,
+          startedAt: row.started_at,
+          completedAt: row.completed_at,
+          violationsCount: row.violations_count,
+          violationLogs: row.violation_logs || [],
+        }));
+        this.setStored(STORAGE_KEYS.SESSIONS, formattedSessions);
+      }
+
+      if (passwordsRes.data) {
+        const passMap: Record<string, string> = {};
+        passwordsRes.data.forEach(row => {
+          passMap[cleanId(row.user_id)] = row.password;
+        });
+        const localPasswords = this.getCustomPasswords();
+        this.setStored(STORAGE_KEYS.PASSWORDS, { ...localPasswords, ...passMap });
+      }
+
+      if (notifsRes.data) {
+        const formattedNotifs: AppNotification[] = notifsRes.data.map(row => ({
+          id: row.id,
+          title: row.title,
+          message: row.message,
+          type: row.type,
+          timestamp: row.timestamp,
+          read: row.read,
+          targetRole: row.target_role,
+          targetUserId: row.target_user_id,
+        }));
+        this.setStored(STORAGE_KEYS.NOTIFICATIONS, formattedNotifs);
+      }
+
+      this.notifyListeners();
+
+      // 2. Setup Realtime subscription across all 900+ users
+      supabase
+        .channel('public:all_changes')
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'exams' }, payload => {
+          const current = this.getExams();
+          if (payload.eventType === 'DELETE') {
+            const updated = current.filter(e => e.id !== (payload.old as any).id);
+            this.setStored(STORAGE_KEYS.EXAMS, updated);
+          } else {
+            const row = payload.new as any;
+            const updatedItem: ExamSchedule = {
+              id: row.id,
+              title: row.title,
+              subject: row.subject,
+              googleFormUrl: row.google_form_url,
+              targetClasses: row.target_classes || [],
+              allowedStudentNisList: row.allowed_student_nis_list || [],
+              startTime: row.start_time,
+              endTime: row.end_time,
+              durationMinutes: row.duration_minutes,
+              lockBrowser: row.lock_browser,
+              instructions: row.instructions,
+              teacherNip: row.teacher_nip,
+              teacherName: row.teacher_name,
+              status: row.status,
+              createdAt: row.created_at,
+            };
+            const idx = current.findIndex(e => e.id === updatedItem.id);
+            if (idx >= 0) current[idx] = updatedItem;
+            else current.unshift(updatedItem);
+            this.setStored(STORAGE_KEYS.EXAMS, current);
+          }
+          this.notifyListeners();
+        })
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'student_sessions' }, payload => {
+          const current = this.getSessions();
+          if (payload.eventType === 'DELETE') {
+            const updated = current.filter(s => s.id !== (payload.old as any).id);
+            this.setStored(STORAGE_KEYS.SESSIONS, updated);
+          } else {
+            const row = payload.new as any;
+            const updatedItem: StudentSession = {
+              id: row.id,
+              examId: row.exam_id,
+              studentNis: row.student_nis,
+              studentName: row.student_name,
+              className: row.class_name,
+              status: row.status,
+              startedAt: row.started_at,
+              completedAt: row.completed_at,
+              violationsCount: row.violations_count,
+              violationLogs: row.violation_logs || [],
+            };
+            const idx = current.findIndex(s => s.id === updatedItem.id);
+            if (idx >= 0) current[idx] = updatedItem;
+            else current.unshift(updatedItem);
+            this.setStored(STORAGE_KEYS.SESSIONS, current);
+          }
+          this.notifyListeners();
+        })
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'custom_passwords' }, payload => {
+          if (payload.eventType !== 'DELETE') {
+            const row = payload.new as any;
+            const passes = this.getCustomPasswords();
+            passes[cleanId(row.user_id)] = row.password;
+            this.setStored(STORAGE_KEYS.PASSWORDS, passes);
+            this.notifyListeners();
+          }
+        })
+        .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'notifications' }, payload => {
+          const row = payload.new as any;
+          const notifs = this.getStored<AppNotification[]>(STORAGE_KEYS.NOTIFICATIONS, []);
+          notifs.unshift({
+            id: row.id,
+            title: row.title,
+            message: row.message,
+            type: row.type,
+            timestamp: row.timestamp,
+            read: row.read,
+            targetRole: row.target_role,
+            targetUserId: row.target_user_id,
+          });
+          this.setStored(STORAGE_KEYS.NOTIFICATIONS, notifs.slice(0, 50));
+          this.notifyListeners();
+        })
+        .subscribe();
+    } catch (err) {
+      console.warn('Supabase sync initialization warning:', err);
+    }
+  }
+
   // Passwords Map { [cleanUserId]: newPassword }
   private getCustomPasswords(): Record<string, string> {
     return this.getStored<Record<string, string>>(STORAGE_KEYS.PASSWORDS, {});
@@ -54,6 +246,17 @@ class SchoolStorage {
     const passwords = this.getCustomPasswords();
     passwords[cleanId(userId)] = newPassword;
     this.setStored(STORAGE_KEYS.PASSWORDS, passwords);
+    this.notifyListeners();
+
+    if (isSupabaseConfigured && supabase) {
+      safeSupabase(
+        supabase.from('custom_passwords').upsert({
+          user_id: cleanId(userId),
+          password: newPassword,
+          updated_at: new Date().toISOString(),
+        })
+      );
+    }
   }
 
   public getUserPassword(userId: string): string {
@@ -155,7 +358,6 @@ class SchoolStorage {
   }
 
   // --- Exams Management ---
-  // Notice: user requested "kosongkan semua data sampel", so default is empty array []!
   public getExams(): ExamSchedule[] {
     return this.getStored<ExamSchedule[]>(STORAGE_KEYS.EXAMS, []);
   }
@@ -169,8 +371,32 @@ class SchoolStorage {
       exams.unshift(exam);
     }
     this.setStored(STORAGE_KEYS.EXAMS, exams);
+    this.notifyListeners();
 
-    // Broadcast notification for students in the class
+    // Sync to Supabase
+    if (isSupabaseConfigured && supabase) {
+      safeSupabase(
+        supabase.from('exams').upsert({
+          id: exam.id,
+          title: exam.title,
+          subject: exam.subject,
+          google_form_url: exam.googleFormUrl,
+          target_classes: exam.targetClasses,
+          allowed_student_nis_list: exam.allowedStudentNisList,
+          start_time: exam.startTime,
+          end_time: exam.endTime,
+          duration_minutes: exam.durationMinutes,
+          lock_browser: exam.lockBrowser,
+          instructions: exam.instructions,
+          teacher_nip: exam.teacherNip,
+          teacher_name: exam.teacherName,
+          status: exam.status || 'scheduled',
+          created_at: exam.createdAt,
+        })
+      );
+    }
+
+    // Broadcast notification for students
     this.addNotification({
       id: `notif_${Date.now()}`,
       title: `Jadwal Ujian Baru: ${exam.subject}`,
@@ -186,9 +412,14 @@ class SchoolStorage {
     const exams = this.getExams().filter(e => e.id !== examId);
     this.setStored(STORAGE_KEYS.EXAMS, exams);
 
-    // Also clean up any sessions for this exam
     const sessions = this.getSessions().filter(s => s.examId !== examId);
     this.setStored(STORAGE_KEYS.SESSIONS, sessions);
+    this.notifyListeners();
+
+    // Delete in Supabase
+    if (isSupabaseConfigured && supabase) {
+      safeSupabase(supabase.from('exams').delete().eq('id', examId));
+    }
   }
 
   // --- Student Sessions & Anti-Cheat Real-time Monitoring ---
@@ -228,6 +459,27 @@ class SchoolStorage {
     }
 
     this.setStored(STORAGE_KEYS.SESSIONS, sessions);
+    this.notifyListeners();
+
+    // Supabase Realtime sync
+    if (isSupabaseConfigured && supabase) {
+      safeSupabase(
+        supabase.from('student_sessions').upsert({
+          id: session.id,
+          exam_id: session.examId,
+          student_nis: session.studentNis,
+          student_name: session.studentName,
+          class_name: session.className,
+          status: session.status,
+          started_at: session.startedAt,
+          completed_at: session.completedAt || null,
+          violations_count: session.violationsCount,
+          violation_logs: session.violationLogs,
+          updated_at: new Date().toISOString(),
+        })
+      );
+    }
+
     return session;
   }
 
@@ -238,6 +490,25 @@ class SchoolStorage {
       session.status = 'selesai';
       session.completedAt = new Date().toISOString();
       this.setStored(STORAGE_KEYS.SESSIONS, sessions);
+      this.notifyListeners();
+
+      if (isSupabaseConfigured && supabase) {
+        safeSupabase(
+          supabase.from('student_sessions').upsert({
+            id: session.id,
+            exam_id: session.examId,
+            student_nis: session.studentNis,
+            student_name: session.studentName,
+            class_name: session.className,
+            status: session.status,
+            started_at: session.startedAt,
+            completed_at: session.completedAt,
+            violations_count: session.violationsCount,
+            violation_logs: session.violationLogs,
+            updated_at: new Date().toISOString(),
+          })
+        );
+      }
     }
   }
 
@@ -257,14 +528,31 @@ class SchoolStorage {
         description,
       });
 
-      // If violations exceed 5, flag as locked
       if (session.violationsCount >= 5) {
         session.status = 'terkunci_curang';
       }
 
       this.setStored(STORAGE_KEYS.SESSIONS, sessions);
+      this.notifyListeners();
 
-      // Create high-priority real-time alert for proctors/teachers
+      if (isSupabaseConfigured && supabase) {
+        safeSupabase(
+          supabase.from('student_sessions').upsert({
+            id: session.id,
+            exam_id: session.examId,
+            student_nis: session.studentNis,
+            student_name: session.studentName,
+            class_name: session.className,
+            status: session.status,
+            started_at: session.startedAt,
+            completed_at: session.completedAt || null,
+            violations_count: session.violationsCount,
+            violation_logs: session.violationLogs,
+            updated_at: new Date().toISOString(),
+          })
+        );
+      }
+
       this.addNotification({
         id: `alert_${Date.now()}_${Math.random().toString(36).substring(7)}`,
         title: `Peringatan Kecurangan (${session.studentName})`,
@@ -285,6 +573,17 @@ class SchoolStorage {
       session.violationsCount = 0;
       session.status = 'mengerjakan';
       this.setStored(STORAGE_KEYS.SESSIONS, sessions);
+      this.notifyListeners();
+
+      if (isSupabaseConfigured && supabase) {
+        safeSupabase(
+          supabase.from('student_sessions').update({
+            violations_count: 0,
+            status: 'mengerjakan',
+            updated_at: new Date().toISOString(),
+          }).eq('id', session.id)
+        );
+      }
     }
   }
 
@@ -303,8 +602,23 @@ class SchoolStorage {
   public addNotification(notification: AppNotification): void {
     const notifs = this.getStored<AppNotification[]>(STORAGE_KEYS.NOTIFICATIONS, []);
     notifs.unshift(notification);
-    // Keep max 50 recent notifications
     this.setStored(STORAGE_KEYS.NOTIFICATIONS, notifs.slice(0, 50));
+    this.notifyListeners();
+
+    if (isSupabaseConfigured && supabase) {
+      safeSupabase(
+        supabase.from('notifications').insert({
+          id: notification.id,
+          title: notification.title,
+          message: notification.message,
+          type: notification.type,
+          timestamp: notification.timestamp,
+          read: notification.read,
+          target_role: notification.targetRole || 'all',
+          target_user_id: notification.targetUserId || null,
+        })
+      );
+    }
   }
 
   public markNotificationAsRead(id: string): void {
@@ -313,6 +627,11 @@ class SchoolStorage {
     if (target) {
       target.read = true;
       this.setStored(STORAGE_KEYS.NOTIFICATIONS, notifs);
+      this.notifyListeners();
+
+      if (isSupabaseConfigured && supabase) {
+        safeSupabase(supabase.from('notifications').update({ read: true }).eq('id', id));
+      }
     }
   }
 
@@ -320,6 +639,11 @@ class SchoolStorage {
     const notifs = this.getStored<AppNotification[]>(STORAGE_KEYS.NOTIFICATIONS, []);
     notifs.forEach(n => (n.read = true));
     this.setStored(STORAGE_KEYS.NOTIFICATIONS, notifs);
+    this.notifyListeners();
+
+    if (isSupabaseConfigured && supabase) {
+      safeSupabase(supabase.from('notifications').update({ read: true }).neq('id', ''));
+    }
   }
 
   // --- Dark Mode ---

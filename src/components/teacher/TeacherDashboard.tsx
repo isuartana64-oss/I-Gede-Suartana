@@ -52,11 +52,15 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ teacher }) =
 
   useEffect(() => {
     refreshData();
+    const unsubscribe = schoolStorage.subscribe(refreshData);
     const interval = setInterval(() => {
       setCurrentTime(Date.now());
       setSessions(schoolStorage.getSessions());
     }, 3000);
-    return () => clearInterval(interval);
+    return () => {
+      unsubscribe();
+      clearInterval(interval);
+    };
   }, [teacher]);
 
   const handleDeleteExam = (exam: ExamSchedule) => {
